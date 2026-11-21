@@ -45,7 +45,7 @@ public class AsOfSelector {
 
     public record SceneCellMatch(long sceneId, long cellId, String sceneKey, int revisionNo,
                                  Instant acquisitionAt, Instant ingestedAt, double lon, double lat,
-                                 double ndvi) {
+                                 double ndvi, Double cloudCoverPct) {
     }
 
     public record ScenePick(List<SceneCellMatch> cells, boolean anySceneInWindow) {
@@ -54,7 +54,7 @@ public class AsOfSelector {
     // ------------------------------------------------------------------ scenes
 
     public ScenePick selectSatellite(InputLedger.Builder ledger, Geometry geometry, Window window,
-                                     Instant ceiling, long runId, Long caseId, long parcelId,
+                                     Instant ceiling, Long runId, Long caseId, long parcelId,
                                      long boundaryVersionId) {
         List<SceneRow> scenes = db.jdbc().query("""
                         select id, scene_key, revision_no, acquisition_at, ingested_at, cloud_cover_pct, status
@@ -64,7 +64,10 @@ public class AsOfSelector {
                         """,
                 (rs, i) -> new SceneRow(rs.getLong("id"), rs.getString("scene_key"),
                         rs.getInt("revision_no"), Db.instant(rs, "acquisition_at"),
-                        Db.instant(rs, "ingested_at"), rs.getString("status")),
+                        Db.instant(rs, "ingested_at"),
+                        rs.getBigDecimal("cloud_cover_pct") == null
+                                ? null : rs.getBigDecimal("cloud_cover_pct").doubleValue(),
+                        rs.getString("status")),
                 Db.timestamp(window.start()), Db.timestamp(window.end()), Db.timestamp(ceiling));
 
         List<SceneRow> lateScenes = db.jdbc().query("""
@@ -75,7 +78,10 @@ public class AsOfSelector {
                         """,
                 (rs, i) -> new SceneRow(rs.getLong("id"), rs.getString("scene_key"),
                         rs.getInt("revision_no"), Db.instant(rs, "acquisition_at"),
-                        Db.instant(rs, "ingested_at"), rs.getString("status")),
+                        Db.instant(rs, "ingested_at"),
+                        rs.getBigDecimal("cloud_cover_pct") == null
+                                ? null : rs.getBigDecimal("cloud_cover_pct").doubleValue(),
+                        rs.getString("status")),
                 Db.timestamp(window.start()), Db.timestamp(window.end()), Db.timestamp(ceiling));
 
         for (SceneRow late : lateScenes) {
@@ -121,7 +127,8 @@ public class AsOfSelector {
                     continue;
                 }
                 matches.add(new SceneCellMatch(scene.id(), cell.id(), scene.sceneKey(), scene.revisionNo(),
-                        scene.acquisitionAt(), scene.ingestedAt(), cell.lon(), cell.lat(), cell.ndvi()));
+                        scene.acquisitionAt(), scene.ingestedAt(), cell.lon(), cell.lat(), cell.ndvi(),
+                        scene.cloudCoverPct()));
             }
             if (anyInParcel && allocatedElsewhere > 0) {
                 ledger.violation(new InputLedger.Violation("PIXEL_SHARED_BETWEEN_FIELDS", "WARNING",
@@ -175,7 +182,7 @@ public class AsOfSelector {
      * only on stored data, never on which run happens to execute first, so replays reproduce it.
      */
     private PixelOwner resolveOwner(long sceneId, long cellId, double lon, double lat, double ndvi,
-                                    Instant ceiling, long runId, Long caseId, long parcelId,
+                                    Instant ceiling, Long runId, Long caseId, long parcelId,
                                     long boundaryVersionId) {
         List<BoundaryCandidate> candidates = new ArrayList<>();
         db.jdbc().query("""
@@ -238,7 +245,8 @@ public class AsOfSelector {
     // ----------------------------------------------------------------- weather
 
     public record WeatherValue(String stationCode, String externalKey, long observationId, int revisionNo,
-                               double rainfallMm, double weight, Instant observedAt, Instant ingestedAt) {
+                               double rainfallMm, Double tempMeanC, Instant periodStart, Instant periodEnd,
+                               double weight, Instant observedAt, Instant ingestedAt) {
     }
 
     public record WeatherPick(List<WeatherValue> values) {
@@ -259,8 +267,8 @@ public class AsOfSelector {
         List<WeatherValue> values = new ArrayList<>();
         for (StationLink link : links) {
             List<WeatherRow> all = db.jdbc().query("""
-                            select id, external_key, period_start, period_end, rainfall_mm, observed_at,
-                                   ingested_at, revision_no
+                            select id, external_key, period_start, period_end, rainfall_mm, temp_mean_c,
+                                   observed_at, ingested_at, revision_no
                               from weather_observation
                              where station_id = ? and period_end >= ? and period_start <= ?
                              order by external_key, revision_no desc
@@ -268,6 +276,8 @@ public class AsOfSelector {
                     (rs, i) -> new WeatherRow(rs.getLong("id"), rs.getString("external_key"),
                             Db.instant(rs, "period_start"), Db.instant(rs, "period_end"),
                             rs.getBigDecimal("rainfall_mm").doubleValue(),
+                            rs.getBigDecimal("temp_mean_c") == null
+                                    ? null : rs.getBigDecimal("temp_mean_c").doubleValue(),
                             Db.instant(rs, "observed_at"), Db.instant(rs, "ingested_at"),
                             rs.getInt("revision_no")),
                     link.stationId(), Db.timestamp(window.start()), Db.timestamp(window.end()));
@@ -304,8 +314,8 @@ public class AsOfSelector {
                                     + "the older visible revision was used"));
                 }
                 values.add(new WeatherValue(link.stationCode(), chosen.externalKey(), chosen.id(),
-                        chosen.revisionNo(), chosen.rainfallMm(), link.weight(),
-                        chosen.observedAt(), chosen.ingestedAt()));
+                        chosen.revisionNo(), chosen.rainfallMm(), chosen.tempMeanC(), chosen.periodStart(),
+                        chosen.periodEnd(), link.weight(), chosen.observedAt(), chosen.ingestedAt()));
             }
             for (WeatherRow row : all) {
                 if (row.ingestedAt().isAfter(ceiling)
@@ -427,14 +437,15 @@ public class AsOfSelector {
     }
 
     private record SceneRow(long id, String sceneKey, int revisionNo, Instant acquisitionAt,
-                            Instant ingestedAt, String status) {
+                            Instant ingestedAt, Double cloudCoverPct, String status) {
     }
 
     private record StationLink(long stationId, String stationCode, double weight) {
     }
 
     private record WeatherRow(long id, String externalKey, Instant periodStart, Instant periodEnd,
-                              double rainfallMm, Instant observedAt, Instant ingestedAt, int revisionNo) {
+                              double rainfallMm, Double tempMeanC, Instant observedAt, Instant ingestedAt,
+                              int revisionNo) {
     }
 
     private record DeclarationRow(long id, String declarationNo, String cropCode, LocalDate plantingDate,

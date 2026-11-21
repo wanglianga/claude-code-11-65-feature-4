@@ -14,7 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && groupadd -r agri && useradd -r -g agri agri
 COPY --from=build /build/target/agri-pit.jar /app/agri-pit.jar
 COPY scripts/verify.sh /app/scripts/verify.sh
-RUN chmod +x /app/scripts/verify.sh && chown -R agri:agri /app
+COPY scripts/verify-backfill.sh /app/scripts/verify-backfill.sh
+RUN chmod +x /app/scripts/verify.sh /app/scripts/verify-backfill.sh && chown -R agri:agri /app
 USER agri
 EXPOSE 8080
 ENV SERVER_PORT=8080 \

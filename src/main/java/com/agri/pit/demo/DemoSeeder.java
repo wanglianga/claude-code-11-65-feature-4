@@ -1,5 +1,7 @@
 package com.agri.pit.demo;
 
+import com.agri.pit.backfill.DependencyGraphService;
+import com.agri.pit.backfill.MissingPolicyService;
 import com.agri.pit.catalog.CatalogDtos;
 import com.agri.pit.catalog.CatalogService;
 import com.agri.pit.common.Db;
@@ -49,13 +51,18 @@ public class DemoSeeder {
     private final Db db;
     private final CatalogService catalog;
     private final WarehouseService warehouse;
+    private final DependencyGraphService dependencies;
+    private final MissingPolicyService policies;
     private final boolean enabled;
 
     public DemoSeeder(Db db, CatalogService catalog, WarehouseService warehouse,
+                      DependencyGraphService dependencies, MissingPolicyService policies,
                       @Value("${app.demo.seed-on-startup:true}") boolean enabled) {
         this.db = db;
         this.catalog = catalog;
         this.warehouse = warehouse;
+        this.dependencies = dependencies;
+        this.policies = policies;
         this.enabled = enabled;
     }
 
@@ -69,19 +76,20 @@ public class DemoSeeder {
                         select count(*) from claim_case where case_no in (?, ?)
                         """, Integer.class, CASE_PRIMARY, CASE_SECONDARY);
         if (existing != null && existing > 0) {
-            log.info("demo data already present, skipping seed");
-            return;
+            log.info("demo data already present, skipping base seed");
+        } else {
+            log.info("seeding drought demo scenario");
+            seedCatalog();
+            long[] parcels = seedParcelsAndStations();
+            long parcel1 = parcels[0];
+            long parcel2 = parcels[1];
+            seedScenes();
+            seedWeather();
+            seedDeclarations(parcel1, parcel2);
+            seedCases(parcel1, parcel2);
+            log.info("demo seed complete");
         }
-        log.info("seeding drought demo scenario");
-        seedCatalog();
-        long[] parcels = seedParcelsAndStations();
-        long parcel1 = parcels[0];
-        long parcel2 = parcels[1];
-        seedScenes();
-        seedWeather();
-        seedDeclarations(parcel1, parcel2);
-        seedCases(parcel1, parcel2);
-        log.info("demo seed complete");
+        seedBackfillLab();
     }
 
     // ------------------------------------------------------------------ catalog
@@ -273,6 +281,254 @@ public class DemoSeeder {
                         """,
                 caseId, Db.timestamp(CASE_CUTOFF), Db.timestamp(CASE_CUTOFF), HAZARD_DATE,
                 boundaryVersionId);
+    }
+
+    // ========================================================================
+    // Backfill lab demo: the model team's two new features and three years of
+    // historical cases with different point-in-time availability profiles.
+    // ========================================================================
+
+    public static final String FEATURE_GDD = "GDD_AFTER_SOWING";
+    public static final String FEATURE_SLOPE = "NDVI_RECOVERY_SLOPE";
+    public static final String CASE_CLEAN = "HIST-2024-0003";
+    public static final String CASE_LATE_DECL = "HIST-2025-0001";
+    public static final String CASE_CLOUD_LEAD = "HIST-2025-0002";
+    public static final String CASE_CLOUD_TRAIL = "HIST-2025-0003";
+    public static final String CASE_NO_TEMP = "HIST-2026-0001";
+
+    /**
+     * Seeds the backfill lab: feature definitions for effective growing degree days after
+     * sowing and the pre-hazard NDVI recovery slope, their dependency graph entries, the
+     * missing-data policy library, and five historical cases (2024-2026) that exercise every
+     * scanner classification. Idempotent: skipped when the GDD feature already exists.
+     */
+    private void seedBackfillLab() {
+        Integer existing = db.jdbc().queryForObject(
+                "select count(*) from feature_definition where code = ?", Integer.class, FEATURE_GDD);
+        if (existing != null && existing > 0) {
+            log.info("backfill lab demo already present, skipping");
+            return;
+        }
+        log.info("seeding backfill lab demo (new features, policies, historical cases)");
+        seedBackfillCatalog();
+        seedBackfillDependencies();
+        seedBackfillPolicies();
+        seedHistoricalCases();
+    }
+
+    private void seedBackfillCatalog() {
+        // required=false: these features are evaluated by the backfill lab for historical
+        // experiments; the main scoring pipeline leaves them NULL until its windows are extended.
+        catalog.createFeature(new CatalogDtos.CreateFeatureRequest(FEATURE_GDD,
+                "Effective GDD after sowing",
+                "Effective growing degree days (base 10C) accumulated from the planting date to "
+                        + "the hazard date; needs a sowing declaration and a temperature series",
+                "C-day", List.of("WEATHER_OBSERVATION", "PLANTING_DECLARATION")));
+        catalog.createVersion(FEATURE_GDD, new CatalogDtos.CreateVersionRequest(
+                "gdd_effective", false, 0L, "AS_OF_CUTOFF", 120,
+                "v1: raw effective GDD over the sowing-to-hazard window"));
+        catalog.approve(FEATURE_GDD, 1, "model-team", "initial GDD feature for historical evaluation");
+        catalog.createVersion(FEATURE_GDD, new CatalogDtos.CreateVersionRequest(
+                "gdd_effective * 0.85", false, 0L, "AS_OF_CUTOFF", 120,
+                "v2: calibrated GDD (x0.85) - concurrent version for the backfill scheduler"));
+        catalog.approve(FEATURE_GDD, 2, "model-team", "calibration update");
+
+        catalog.createFeature(new CatalogDtos.CreateFeatureRequest(FEATURE_SLOPE,
+                "Pre-hazard NDVI recovery slope",
+                "Least-squares slope of the per-scene mean NDVI inside the 45-day pre-hazard "
+                        + "imagery window; needs at least two usable scenes",
+                "ndvi/day", List.of("SATELLITE_NDVI")));
+        catalog.createVersion(FEATURE_SLOPE, new CatalogDtos.CreateVersionRequest(
+                "ndvi_recovery_slope", false, 0L, "AS_OF_CUTOFF", 45,
+                "v1: vegetation recovery slope before the disaster"));
+        catalog.approve(FEATURE_SLOPE, 1, "model-team", "initial recovery slope");
+    }
+
+    private void seedBackfillDependencies() {
+        dependencies.ensureRegistered(FEATURE_GDD, "SOWING_DATE", null,
+                "planting date anchors the GDD window; a declaration ingested after the case "
+                        + "cutoff is look-ahead risk");
+        ObjectNode tempParams = db.mapper().createObjectNode();
+        tempParams.put("baseTempC", 10.0);
+        tempParams.put("minCoverage", 0.8);
+        tempParams.put("fallbackWindowDays", 120);
+        dependencies.ensureRegistered(FEATURE_GDD, "TEMPERATURE_SERIES", tempParams,
+                "daily/weekly mean temperature over the sowing-to-hazard window");
+        ObjectNode imageryParams = db.mapper().createObjectNode();
+        imageryParams.put("windowDays", 45);
+        imageryParams.put("maxCloudPct", 30.0);
+        imageryParams.put("minScenes", 2);
+        dependencies.ensureRegistered(FEATURE_SLOPE, "IMAGERY_SEQUENCE", imageryParams,
+                "scene sequence in the 45-day pre-hazard window; cloud-occluded scenes are "
+                        + "handled by the CLOUD_OCCLUSION policy");
+    }
+
+    private void seedBackfillPolicies() {
+        ObjectNode cloudParams = db.mapper().createObjectNode();
+        cloudParams.put("maxCloudPct", 30.0);
+        policies.create(new com.agri.pit.backfill.BackfillDtos.CreatePolicyRequest(
+                "CLOUD_OCCLUSION", "INTERPOLATE", cloudParams,
+                "v1: interpolate cloud-occluded scenes from the nearest clear neighbours"));
+        policies.create(new com.agri.pit.backfill.BackfillDtos.CreatePolicyRequest(
+                "CLOUD_OCCLUSION", "EXCLUDE_MISSING", cloudParams,
+                "v2: exclude cloud-occluded scenes; report the feature missing when the sequence "
+                        + "thins out (supersedes interpolation for reporting)"));
+        policies.create(new com.agri.pit.backfill.BackfillDtos.CreatePolicyRequest(
+                "LATE_DECLARATION", "FLAG_LOOKAHEAD_RISK", null,
+                "v1: a declaration ingested after the case cutoff is look-ahead risk and is "
+                        + "never adopted for historical evaluation"));
+        policies.create(new com.agri.pit.backfill.BackfillDtos.CreatePolicyRequest(
+                "MISSING_WEATHER", "EXCLUDE_MISSING", null,
+                "v1: compute over the visible periods; missing periods are excluded and the "
+                        + "coverage ratio is reported"));
+    }
+
+    // ------------------------------------------------------- historical cases
+
+    private void seedHistoricalCases() {
+        // Case 1: clean history, every input visible at the cutoff -> EVALUABLE for both features.
+        long p1 = histParcel("P-2001", "East ridge wheat", "Hebei-East",
+                116.100, 40.100, 116.110, 40.110, "2024-01-06T08:00:00Z");
+        histWeather("WS-2001", p1, LocalDate.of(2024, 4, 25), 15, 16.0, 0.8, false);
+        histDeclaration("DECL-2024-2001", p1, LocalDate.of(2024, 5, 2), 6.2,
+                "2024-05-08T08:00:00Z");
+        histScene("SCENE-H1-A", p1, "2024-07-01T10:00:00Z", 8.0, 0.30);
+        histScene("SCENE-H1-B", p1, "2024-07-11T10:00:00Z", 12.0, 0.34);
+        histScene("SCENE-H1-C", p1, "2024-07-21T10:00:00Z", 6.0, 0.38);
+        histScene("SCENE-H1-D", p1, "2024-07-31T10:00:00Z", 14.0, 0.42);
+        histScene("SCENE-H1-E", p1, "2024-08-08T10:00:00Z", 9.0, 0.45);
+        histCase(CASE_CLEAN, "POL-2024-2001", p1, LocalDate.of(2024, 8, 10),
+                Instant.parse("2024-08-12T00:00:00Z"));
+
+        // Case 2: the only planting declaration was ingested AFTER the case cutoff -> the GDD
+        // feature is look-ahead risk; the slope feature is fine.
+        long p2 = histParcel("P-2002", "West basin wheat", "Hebei-West",
+                116.200, 40.200, 116.210, 40.210, "2024-11-06T08:00:00Z");
+        histWeather("WS-2002", p2, LocalDate.of(2025, 2, 27), 16, 12.0, 0.9, false);
+        histDeclaration("DECL-2025-2002", p2, LocalDate.of(2025, 3, 7), 5.4,
+                "2025-06-20T02:00:00Z");
+        histScene("SCENE-H2-A", p2, "2025-05-05T10:00:00Z", 7.0, 0.28);
+        histScene("SCENE-H2-B", p2, "2025-05-15T10:00:00Z", 10.0, 0.33);
+        histScene("SCENE-H2-C", p2, "2025-05-25T10:00:00Z", 5.0, 0.37);
+        histScene("SCENE-H2-D", p2, "2025-06-04T10:00:00Z", 12.0, 0.41);
+        histCase(CASE_LATE_DECL, "POL-2025-2002", p2, LocalDate.of(2025, 6, 15),
+                Instant.parse("2025-06-17T00:00:00Z"));
+
+        // Case 3: the first half of the imagery sequence is cloud-occluded -> interpolation and
+        // exclusion produce different slopes for the same case.
+        long p3 = histParcel("P-2003", "Central loess wheat", "Hebei-Central",
+                116.300, 40.300, 116.310, 40.310, "2025-01-06T08:00:00Z");
+        histWeather("WS-2003", p3, LocalDate.of(2025, 5, 26), 16, 18.0, 0.6, false);
+        histDeclaration("DECL-2025-2003", p3, LocalDate.of(2025, 6, 2), 7.1,
+                "2025-06-09T08:00:00Z");
+        histScene("SCENE-H3-A", p3, "2025-08-01T10:00:00Z", 65.0, 0.30);
+        histScene("SCENE-H3-B", p3, "2025-08-12T10:00:00Z", 70.0, 0.34);
+        histScene("SCENE-H3-C", p3, "2025-08-22T10:00:00Z", 10.0, 0.40);
+        histScene("SCENE-H3-D", p3, "2025-09-01T10:00:00Z", 8.0, 0.46);
+        histCase(CASE_CLOUD_LEAD, "POL-2025-2003", p3, LocalDate.of(2025, 9, 10),
+                Instant.parse("2025-09-12T00:00:00Z"));
+
+        // Case 4: only one cloud-free scene; interpolation still yields a (flat-tail) slope,
+        // while exclusion leaves the sequence too thin -> missing under EXCLUDE_MISSING.
+        long p4 = histParcel("P-2004", "South hill wheat", "Hebei-South",
+                116.400, 40.400, 116.410, 40.410, "2025-02-06T08:00:00Z");
+        histWeather("WS-2004", p4, LocalDate.of(2025, 6, 24), 17, 20.0, 0.5, false);
+        histDeclaration("DECL-2025-2004", p4, LocalDate.of(2025, 7, 1), 4.8,
+                "2025-07-06T08:00:00Z");
+        histScene("SCENE-H4-A", p4, "2025-09-10T10:00:00Z", 12.0, 0.33);
+        histScene("SCENE-H4-B", p4, "2025-09-25T10:00:00Z", 66.0, 0.38);
+        histScene("SCENE-H4-C", p4, "2025-10-10T10:00:00Z", 72.0, 0.42);
+        histCase(CASE_CLOUD_TRAIL, "POL-2025-2004", p4, LocalDate.of(2025, 10, 20),
+                Instant.parse("2025-10-22T00:00:00Z"));
+
+        // Case 5: temperature was never measured (temp_mean_c is null) -> GDD is post-hoc only;
+        // the imagery sequence is complete.
+        long p5 = histParcel("P-2005", "North plain wheat", "Hebei-North",
+                116.500, 40.500, 116.510, 40.510, "2025-11-06T08:00:00Z");
+        histWeather("WS-2005", p5, LocalDate.of(2026, 2, 3), 15, 0.0, 0.0, true);
+        histDeclaration("DECL-2026-2005", p5, LocalDate.of(2026, 2, 10), 5.9,
+                "2026-02-15T08:00:00Z");
+        histScene("SCENE-H5-A", p5, "2026-04-10T10:00:00Z", 9.0, 0.25);
+        histScene("SCENE-H5-B", p5, "2026-04-20T10:00:00Z", 11.0, 0.30);
+        histScene("SCENE-H5-C", p5, "2026-04-30T10:00:00Z", 7.0, 0.35);
+        histScene("SCENE-H5-D", p5, "2026-05-10T10:00:00Z", 13.0, 0.40);
+        histCase(CASE_NO_TEMP, "POL-2026-2005", p5, LocalDate.of(2026, 5, 20),
+                Instant.parse("2026-05-22T00:00:00Z"));
+    }
+
+    /** Parcel + one boundary version + one weather station. Returns the parcel id. */
+    private long histParcel(String code, String name, String region,
+                            double minLon, double minLat, double maxLon, double maxLat,
+                            String boundaryIngested) {
+        long parcelId = warehouse.createParcel(new IngestDtos.ParcelRequest(code, name, region, "WHEAT"));
+        warehouse.addBoundary(parcelId, new IngestDtos.BoundaryRequest(1,
+                polygon(minLon, minLat, maxLon, maxLat),
+                LocalDate.of(2024, 1, 1), null,
+                Instant.parse(boundaryIngested).minusSeconds(24 * 3600), Instant.parse(boundaryIngested),
+                null, "legacy survey"));
+        String stationCode = "WS-" + code.substring(2);
+        long stationId = warehouse.createStation(new IngestDtos.StationRequest(stationCode,
+                name + " station", (minLon + maxLon) / 2, (minLat + maxLat) / 2));
+        warehouse.linkStation(parcelId, stationId, 1.0);
+        HIST_GEO.put(code, new double[]{minLon, minLat, maxLon, maxLat});
+        return parcelId;
+    }
+
+    private static final java.util.Map<String, double[]> HIST_GEO = new java.util.HashMap<>();
+
+    private void histWeather(String stationCode, long parcelId, LocalDate start, int weeks,
+                             double tempStart, double tempStep, boolean nullTemp) {
+        for (int week = 0; week < weeks; week++) {
+            LocalDate periodStart = start.plusWeeks(week);
+            LocalDate periodEnd = periodStart.plusDays(6);
+            Instant observed = endOf(periodEnd);
+            Instant ingested = observed.plusSeconds(6 * 3600);
+            Double temp = nullTemp ? null : tempStart + week * tempStep;
+            warehouse.ingestWeather(new IngestDtos.WeatherRequest(stationCode,
+                    stationCode + "-W" + periodStart, startOf(periodStart), endOf(periodEnd),
+                    4.0 + (week % 5), temp, observed, ingested, null, null, "ground-station"));
+        }
+    }
+
+    private void histDeclaration(String declarationNo, long parcelId, LocalDate plantingDate,
+                                 double areaHa, String ingestedAt) {
+        warehouse.ingestDeclaration(new IngestDtos.DeclarationRequest(declarationNo, parcelId,
+                "WHEAT", plantingDate, areaHa,
+                Instant.parse(ingestedAt).minusSeconds(48 * 3600), Instant.parse(ingestedAt),
+                null, null, "county-submission"));
+    }
+
+    /** A scene whose cells sit inside the parcel box; ingested two days after acquisition. */
+    private void histScene(String sceneKey, long parcelId, String acquisitionAt, double cloudPct,
+                           double ndvi) {
+        String parcelCode = db.jdbc().queryForObject(
+                "select parcel_code from parcel where id = ?", String.class, parcelId);
+        double[] box = HIST_GEO.get(parcelCode);
+        double cx = (box[0] + box[2]) / 2;
+        double cy = (box[1] + box[3]) / 2;
+        Instant acquired = Instant.parse(acquisitionAt);
+        warehouse.ingestScene(new IngestDtos.SceneRequest(sceneKey, 1, acquired,
+                acquired.plusSeconds(48 * 3600), cloudPct,
+                footprint(box[0] - 0.005, box[1] - 0.005, box[2] + 0.005, box[3] + 0.005),
+                "sentinel-2", null, List.of(
+                        cell(sceneKey + "-1", cx - 0.002, cy, ndvi),
+                        cell(sceneKey + "-2", cx, cy + 0.002, ndvi),
+                        cell(sceneKey + "-3", cx + 0.002, cy - 0.002, ndvi))));
+    }
+
+    /** Legacy scored case: no runs, no locks - the predecessor system's record. */
+    private void histCase(String caseNo, String policyNo, long parcelId, LocalDate hazardDate,
+                          Instant cutoff) {
+        long boundaryVersionId = db.jdbc().queryForObject("""
+                        select id from parcel_boundary_version where parcel_id = ? and version_no = 1
+                        """, Long.class, parcelId);
+        db.insert("""
+                        insert into claim_case
+                            (case_no, policy_no, parcel_id, crop_code, hazard_type, hazard_date,
+                             scoring_cutoff, boundary_version_id, status)
+                        values (?, ?, ?, 'WHEAT', 'DROUGHT', ?, ?, ?, 'SCORED')
+                        """,
+                caseNo, policyNo, parcelId, hazardDate, Db.timestamp(cutoff), boundaryVersionId);
     }
 
     // ---------------------------------------------------------------- utilities

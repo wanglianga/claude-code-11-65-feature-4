@@ -35,6 +35,16 @@ public class OpenApiConfig {
                                    shared pixels excluded instead of double counting them.
                                 3. A weather revision that arrives after settlement only creates a pending review
                                    candidate. The frozen snapshot and the settled payout are never rewritten.
+
+                                **Backfill lab.** New model features (effective GDD after sowing, pre-hazard NDVI
+                                recovery slope) are backfilled over three years of historical cases under strict
+                                evidence rules: a dependency graph registers what each feature needs; an availability
+                                scanner separates EVALUABLE cases from POST_HOC_ONLY ones (a planting declaration
+                                ingested after the case cutoff is look-ahead risk, never adopted); a versioned policy
+                                library defines cloud-occlusion / late-declaration / missing-weather handling; the
+                                scheduler shards backfills by definition version; and immutable experiment snapshots
+                                store inputs, outputs and missing reasons. A policy change always starts a new
+                                experiment — reported metrics are never overwritten.
                                 """)
                         .contact(new Contact().name("Claims platform"))
                         .license(new License().name("Proprietary")))
